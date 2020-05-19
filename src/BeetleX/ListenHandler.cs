@@ -18,11 +18,15 @@ namespace BeetleX
 
         public string CertificatePassword { get; set; }
 
+        public bool SyncAccept { get; set; } = true;
+
         public bool SSL { get; set; }
 
         public Socket Socket { get; internal set; }
 
         public IPEndPoint IPEndPoint { get; private set; }
+
+        public bool ReuseAddress { get; set; } = false;
 
         public IServer Server { get; internal set; }
 
@@ -31,6 +35,8 @@ namespace BeetleX
         private SocketAsyncEventArgs mAcceptEventArgs = new SocketAsyncEventArgs();
 
         private Action<AcceptSocketInfo> mAcceptCallBack;
+
+        public Exception Error { get; set; }
 
         internal void Run(IServer server, Action<AcceptSocketInfo> acceptCallback)
         {
@@ -51,10 +57,12 @@ namespace BeetleX
                 try
                 {
                     Certificate = new X509Certificate2(CertificateFile, CertificatePassword);
-                    server.Log(EventArgs.LogType.Info, null, $"load ssl certificate {Certificate}");
+                    if (server.EnableLog(EventArgs.LogType.Info))
+                        server.Log(EventArgs.LogType.Info, null, $"load ssl certificate {Certificate}");
                 }
                 catch (Exception e_)
                 {
+                    Error = e_;
                     if (Server.EnableLog(EventArgs.LogType.Error))
                     {
                         Server.Log(EventArgs.LogType.Error, null, $"{Host}@{Port} enabled ssl load certificate file error {e_.Message}|{e_.StackTrace}!");
@@ -63,6 +71,86 @@ namespace BeetleX
                 }
             }
             BeginListen();
+        }
+
+        private void BeginListen()
+        {
+            try
+            {
+                System.Net.IPAddress address;
+                if (string.IsNullOrEmpty(Host))
+                {
+                    if (Socket.OSSupportsIPv6 && Server.Options.UseIPv6)
+                    {
+                        address = IPAddress.IPv6Any;
+                    }
+                    else
+                    {
+                        address = IPAddress.Any;
+                    }
+                }
+                else
+                {
+                    address = System.Net.IPAddress.Parse(Host);
+                }
+                IPEndPoint = new System.Net.IPEndPoint(address, Port);
+                Socket = new Socket(IPEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                if (IPEndPoint.Address == IPAddress.IPv6Any)
+                {
+                    Socket.DualMode = true;
+                }
+                if (this.ReuseAddress)
+                {
+                    Socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                }
+                Socket.Bind(IPEndPoint);
+                Socket.Listen(512 * 4);
+                if (Server.EnableLog(EventArgs.LogType.Info))
+                    Server.Log(EventArgs.LogType.Info, null, $"listen {Host}@{Port} success ssl:{SSL}");
+                if (SyncAccept)
+                {
+                    System.Threading.ThreadPool.QueueUserWorkItem((o) => OnSyncAccept());
+                }
+                else
+                {
+                    OnAsyncAccept();
+                }
+            }
+            catch (Exception e_)
+            {
+                Error = e_;
+                if (Server.EnableLog(EventArgs.LogType.Error))
+                {
+                    Server.Log(EventArgs.LogType.Error, null, $"listen {Host}@{Port} error {e_.Message}|{e_.StackTrace}!");
+                }
+            }
+        }
+
+        private void OnSyncAccept()
+        {
+            try
+            {
+                while (true)
+                {
+                    var acceptSocket = Socket.Accept();
+                    AcceptSocketInfo item = new AcceptSocketInfo();
+                    item.Socket = acceptSocket;
+                    item.Listen = this;
+                    mAcceptCallBack(item);
+                }
+            }
+            catch (Exception e_)
+            {
+                Error = e_;
+                if (Server.EnableLog(EventArgs.LogType.Error))
+                {
+                    Server.Log(EventArgs.LogType.Error, null, $"{Host}@{Port} accept error {e_.Message}|{e_.StackTrace}!");
+                }
+                if (Server.EnableLog(EventArgs.LogType.Warring))
+                {
+                    Server.Log(EventArgs.LogType.Error, null, $"{Host}@{Port} accept stoped!");
+                }
+            }
         }
 
         private void OnAcceptCompleted(object sender, SocketAsyncEventArgs e)
@@ -101,18 +189,20 @@ namespace BeetleX
                 if (mAsyncAccepts >= 50)
                 {
                     mAsyncAccepts = 0;
-                    Task.Run(() => { BeginAccept(); });
+                    Task.Run(() => { OnAsyncAccept(); });
                 }
                 else
                 {
-                    BeginAccept();
+                    OnAsyncAccept();
                 }
             }
         }
 
+
+
         private int mAsyncAccepts = 0;
 
-        private void BeginAccept()
+        private void OnAsyncAccept()
         {
             if (Server.EnableLog(EventArgs.LogType.Debug))
             {
@@ -120,6 +210,7 @@ namespace BeetleX
             }
             try
             {
+
                 mAcceptEventArgs.AcceptSocket = null;
                 if (!Socket.AcceptAsync(mAcceptEventArgs))
                 {
@@ -145,44 +236,9 @@ namespace BeetleX
             }
         }
 
-        private void BeginListen()
+        public override string ToString()
         {
-            try
-            {
-                System.Net.IPAddress address;
-                if (string.IsNullOrEmpty(Host))
-                {
-                    if (Socket.OSSupportsIPv6 && Server.Options.UseIPv6)
-                    {
-                        address = IPAddress.IPv6Any;
-                    }
-                    else
-                    {
-                        address = IPAddress.Any;
-                    }
-                }
-                else
-                {
-                    address = System.Net.IPAddress.Parse(Host);
-                }
-                IPEndPoint = new System.Net.IPEndPoint(address, Port);
-                Socket = new Socket(IPEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-                if (IPEndPoint.Address == IPAddress.IPv6Any)
-                {
-                    Socket.DualMode = true;
-                }
-                Socket.Bind(IPEndPoint);
-                Socket.Listen(512 * 4);
-                Server.Log(EventArgs.LogType.Info, null, $"listen {Host}@{Port} success ssl:{SSL}");
-                BeginAccept();
-            }
-            catch (Exception e_)
-            {
-                if (Server.EnableLog(EventArgs.LogType.Error))
-                {
-                    Server.Log(EventArgs.LogType.Error, null, $"listen {Host}@{Port} error {e_.Message}|{e_.StackTrace}!");
-                }
-            }
+            return $"Listen {Host}:{Port}\t[SSL:{SSL}]\t[Status:{(Error == null ? "success" : "error")}]";
         }
 
         public void Dispose()

@@ -26,7 +26,7 @@ namespace BeetleX
 
         private EventArgs.SessionReceiveEventArgs mReceiveArgs = new EventArgs.SessionReceiveEventArgs();
 
-        private bool mSendStatus = false;
+        private int mSendStatus = 0;
 
         private object mLockSendStatus = new object();
 
@@ -133,8 +133,7 @@ namespace BeetleX
 
         private object DequeueSendMessage()
         {
-            object result;
-            if (mSendMessages.TryDequeue(out result))
+            if (mSendMessages.TryDequeue(out object result))
             {
                 System.Threading.Interlocked.Decrement(ref mCount);
             }
@@ -145,18 +144,20 @@ namespace BeetleX
         {
             try
             {
-
                 object data = DequeueSendMessage();
                 while (data != null)
                 {
-                    if (data is IBuffer)
-                        ((IBuffer)data).Free();
+                    if (data is IBuffer buffer)
+                    {
+                        BeetleX.Buffers.Buffer.Free(buffer);
+                        //((IBuffer)data).Free();
+                    }
                     data = DequeueSendMessage();
                 }
-                if (SendEventArgs != null)
-                    SendEventArgs.Dispose();
-                if (ReceiveEventArgs != null)
-                    ReceiveEventArgs.Dispose();
+                SendEventArgs?.Dispose();
+                SendEventArgs?.Clear();
+                ReceiveEventArgs?.Dispose();
+                ReceiveEventArgs?.Clear();
                 mReceiveArgs.Server = null;
                 mReceiveArgs.Session = null;
                 mBaseNetStream.Dispose();
@@ -189,7 +190,12 @@ namespace BeetleX
         public void SyncSSLData()
         {
             mBaseNetStream.SSLConfirmed = true;
-            mSslStream.SyncData();
+            mSslStream.SyncData(SslReceive);
+        }
+
+        private void SslReceive()
+        {
+            InvokeReceiveEvent();
         }
 
         public void Receive(IBuffer buffer)
@@ -197,7 +203,8 @@ namespace BeetleX
             if (!mIsDisposed)
             {
                 mBaseNetStream.Import(buffer);
-                InvokeReceiveEvent();
+                if (!SSL)
+                    InvokeReceiveEvent();
             }
             else
             {
@@ -211,17 +218,8 @@ namespace BeetleX
             set;
         }
 
-        //internal Dispatchs.SingleThreadDispatcher<ISession> SendDispatcher
-        //{
-        //    get;
-        //    set;
-        //}
 
-        public double TimeOut
-        {
-            get;
-            set;
-        }
+        public double TimeOut { get; set; } = 999999999;
 
         public EndPoint RemoteEndPoint
         {
@@ -237,82 +235,86 @@ namespace BeetleX
 
         internal void InvokeReceiveEvent()
         {
-            if (!mIsDisposed)
+            try
             {
-                if (SSL)
+                if (!mIsDisposed)
                 {
-                    if (mSslStream.SyncDataError != null)
+                    if (SSL)
                     {
-                        if (Server.EnableLog(EventArgs.LogType.Error))
+                        Exception error = mSslStream.SyncDataError;
+                        if (error != null)
                         {
-                            Server.Log(EventArgs.LogType.Error, null,
-                                $"{RemoteEndPoint} sync SslStream date error {mSslStream.SyncDataError.Message}@{mSslStream.SyncDataError.StackTrace}");
+                            if (Server.EnableLog(EventArgs.LogType.Warring))
+                            {
+                                Server.Log(EventArgs.LogType.Warring, null,
+                                    $"{RemoteEndPoint} sync SslStream date error {error.Message}@{error.StackTrace}");
+                            }
+                            this.Dispose();
+                            return;
                         }
-                        this.Dispose();
-                        return;
                     }
+                    mReceiveArgs.Server = this.Server;
+                    mReceiveArgs.Session = this;
+                    mReceiveArgs.Stream = this.Stream;
+                    Server.SessionReceive(mReceiveArgs);
                 }
-                mReceiveArgs.Server = this.Server;
-                mReceiveArgs.Session = this;
-                mReceiveArgs.Stream = this.Stream;
-                Server.SessionReceive(mReceiveArgs);
+            }
+            catch(Exception e_)
+            {
+                if (Server.EnableLog(EventArgs.LogType.Warring))
+                {
+                    Server.Log(EventArgs.LogType.Warring, null,
+                        $"{RemoteEndPoint} invoke receive event error  {e_.Message}@{e_.StackTrace}");
+                }
             }
         }
 
         internal void ProcessSendMessages()
         {
             IBuffer[] items;
-            if (IsDisposed)
+            if (IsDisposed || mCount == 0)
                 return;
-            BufferLink bufferLink = new BufferLink();
-            object data = DequeueSendMessage();
-            PipeStream pipStream = Stream.ToPipeStream();
-            while (data != null)
+            if (System.Threading.Interlocked.CompareExchange(ref mSendStatus, 1, 0) == 0)
             {
-                if (data is IBuffer)
+                BufferLink bufferLink = new BufferLink();
+                object data = DequeueSendMessage();
+                PipeStream pipStream = Stream.ToPipeStream();
+                while (data != null)
                 {
-                    bufferLink.Import((IBuffer)data);
-                }
-                else if (data is IBuffer[])
-                {
-                    items = (IBuffer[])data;
-                    for (int i = 0; i < items.Length; i++)
+                    if (data is IBuffer)
                     {
-                        bufferLink.Import(items[i]);
+                        bufferLink.Import((IBuffer)data);
                     }
-                }
-                else if (data is IEnumerable<IBuffer>)
-                {
-                    foreach (IBuffer item in (IEnumerable<IBuffer>)data)
+                    else
                     {
-                        bufferLink.Import(item);
+                        WriterData(data, pipStream);
                     }
+                    data = DequeueSendMessage();
+                }
+                if (SSL && pipStream.CacheLength > 0)
+                {
+                    pipStream.Flush();
+                }
+                IBuffer streamBuffer = mBaseNetStream.GetWriteCacheBufers();
+                bufferLink.Import(streamBuffer);
+                if (bufferLink.First != null)
+                {
+                    CommitBuffer(bufferLink.First);
                 }
                 else
                 {
-
-                    WriterData(data, pipStream);
-
+                    System.Threading.Interlocked.Exchange(ref mSendStatus, 0);
+                    if (!mSendMessages.IsEmpty)
+                        ProcessSendMessages();
                 }
-                data = DequeueSendMessage();
             }
-            if (SSL && pipStream.CacheLength > 0)
-            {
-                pipStream.Flush();
-            }
-            IBuffer streamBuffer = mBaseNetStream.GetWriteCacheBufers();
-            bufferLink.Import(streamBuffer);
-            if (bufferLink.First != null)
-            {
-                CommitBuffer(bufferLink.First);
-            }
-
         }
 
         internal void CommitBuffer(IBuffer buffer)
         {
             try
             {
+                buffer.Postion = 0;
                 ((Buffers.Buffer)buffer).AsyncTo(this.SendEventArgs, this);
             }
             catch (Exception e_)
@@ -325,14 +327,7 @@ namespace BeetleX
 
         internal void SendCompleted()
         {
-            lock (mLockSendStatus)
-            {
-                if (mSendMessages.IsEmpty)
-                {
-                    mSendStatus = false;
-                    return;
-                }
-            }
+            System.Threading.Interlocked.Exchange(ref mSendStatus, 0);
             ProcessSendMessages();
         }
 
@@ -341,37 +336,39 @@ namespace BeetleX
         {
             if (IsDisposed || (int)this.Authentication < 2)
             {
+                if (data is IBuffer buffer)
+                {
+                    Buffers.Buffer.Free(buffer);
+                }
+                return false;
+            }
+            if (MaxWaitMessages > 0 && Count > MaxWaitMessages)
+            {
+                if (data is IBuffer buffer)
+                {
+                    Buffers.Buffer.Free(buffer);
+                }
+                if (Server.EnableLog(EventArgs.LogType.Error))
+                    Server.Log(EventArgs.LogType.Error, this, $"{RemoteEndPoint} session send queue overflow!");
+                Dispose();
                 return false;
             }
             EnqueueSendMessage(data);
-            bool send = false;
-            lock (mLockSendStatus)
-            {
-                if (!mSendStatus)
-                {
-                    mSendStatus = true;
-                    send = true;
-                }
-            }
-            if (send)
-                ProcessSendMessages();
+            ProcessSendMessages();
             return true;
         }
 
         private void WriterData(object data, System.IO.Stream stream)
         {
-            if (data is byte[])
+            if (data is IWriteHandler handler)
             {
-                byte[] bytes = (byte[])data;
-                stream.Write(bytes, 0, bytes.Length);
-            }
-            else if (data is ArraySegment<byte>)
-            {
-                ArraySegment<byte> segment = (ArraySegment<byte>)data;
-                stream.Write(segment.Array, segment.Offset, segment.Count);
+                handler.Write(stream);
+                handler.Completed?.Invoke(handler);
             }
             else
             {
+                if (Packet == null)
+                    throw new BXException("message formater is null!");
                 Packet.Encode(data, this, stream);
             }
         }
@@ -412,6 +409,8 @@ namespace BeetleX
 
         public bool SSL { get; internal set; }
 
+        public int MaxWaitMessages { get; set; }
+
         public void CreateSSL(AsyncCallback asyncCallback, ListenHandler listen, IServer server)
         {
             try
@@ -421,18 +420,14 @@ namespace BeetleX
                 mBaseNetStream.SSL = true;
                 mSslStream = new SslStreamX(this.SendBufferPool, server.Options.Encoding,
                     server.Options.LittleEndian, mBaseNetStream, false);
-#if(NETSTANDARD2_0)
-                mSslStream.BeginAuthenticateAsServer(Server.Certificate, new AsyncCallback(asyncCallback),
-                    new Tuple<TcpSession, SslStream>(this, this.mSslStream));
-#else
+
                 mSslStream.BeginAuthenticateAsServer(listen.Certificate, false, true, new AsyncCallback(asyncCallback),
                      new Tuple<TcpSession, SslStream>(this, this.mSslStream));
-#endif
             }
             catch (Exception e_)
             {
-                if (server.EnableLog(EventArgs.LogType.Error))
-                    server.Error(e_, this, "{1} create session ssl error {0}", e_.Message, this.RemoteEndPoint);
+                if (server.EnableLog(EventArgs.LogType.Warring))
+                    server.Log(EventArgs.LogType.Warring, this, $"{this.RemoteEndPoint} create session ssl error {e_.Message}@{e_.StackTrace}");
                 this.Dispose();
             }
         }

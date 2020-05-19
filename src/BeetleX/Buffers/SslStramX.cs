@@ -60,15 +60,15 @@ namespace BeetleX.Buffers
 
         public bool AsyncDataStatus { get; set; }
 
-        public async void SyncData()
+        public async void SyncData(Action receive)
         {
-
             while (true)
             {
                 var dest = GetPipeStream();
-                IBuffer buffer = BufferPoolGroup.DefaultGroup.Next().Pop();
+                IBuffer buffer = null;
                 try
                 {
+                    buffer = BufferPoolGroup.DefaultGroup.Next().Pop();
                     int rlen = await ReadAsync(buffer.Data, 0, buffer.Size);
                     if (rlen > 0)
                     {
@@ -78,6 +78,7 @@ namespace BeetleX.Buffers
                     else
                     {
                         buffer.Free();
+                        SyncDataError = new BXException("ssl receive null data!");
                         break;
                     }
 
@@ -85,8 +86,13 @@ namespace BeetleX.Buffers
                 catch (Exception e_)
                 {
                     SyncDataError = e_;
-                    buffer.Free();
+                    buffer?.Free();
                     break;
+                }
+                finally
+                {
+                   receive?.Invoke();
+
                 }
             }
         }
